@@ -11,6 +11,11 @@ function getRandomDelay() {
   return Math.floor(Math.random() * 1500) + 500;
 }
 
+// 生成更短的随机延迟（50 到 150 毫秒之间）
+function getShortRandomDelay() {
+  return Math.floor(Math.random() * 100) + 50;
+}
+
 // 生成随机视口大小
 function getRandomViewport() {
   const width = Math.floor(Math.random() * (1920 - 1024)) + 1024;
@@ -71,21 +76,28 @@ async function waitForCaptchaResponse(page) {
     
     // 监听响应
     page.on('response', async (response) => {
-      const url = response.url();
-      
-      // 检查是否是验证码响应
-      if (url.includes('/captcha/get')) {
-        try {
+      try {
+        // 尝试解析响应内容
+        const contentType = response.headers()['content-type'] || '';
+        if (contentType.includes('application/json')) {
           const responseData = await response.json();
-          if (responseData && responseData.data && responseData.data.dots) {
+          
+          // 检查响应是否包含验证码数据结构
+          if (responseData &&
+              responseData.data &&
+              responseData.data.masterImage &&
+              responseData.data.tileImage &&
+              responseData.data.dots) {
+            
+            console.log('检测到验证码响应');
             captchaData = responseData.data;
             clearTimeout(responseTimeout);
             page.removeAllListeners('response');
             resolve(captchaData);
           }
-        } catch (error) {
-          console.log('解析验证码响应失败:', error.message);
         }
+      } catch (error) {
+        // 忽略非JSON响应或解析错误
       }
     });
   });
@@ -136,10 +148,12 @@ async function handleCaptcha(page) {
       
       // 5. 计算目标位置（dots.x是目标位置）
       const targetX = captchaData.dots.x;
+      console.log(`目标位置: x=${targetX}`);
       
       // 6. 模拟人类拖动行为
       await page.mouse.move(sliderBox.x + sliderBox.width/2, sliderBox.y + sliderBox.height/2);
       await page.mouse.down();
+      await new Promise(resolve => setTimeout(resolve, getShortRandomDelay())); // 短暂停顿
       
       // 生成人类般的移动轨迹
       const path = generateHumanLikePath(sliderBox.x, sliderBox.x + targetX, sliderBox.y + sliderBox.height/2);
@@ -155,18 +169,65 @@ async function handleCaptcha(page) {
       console.log('滑块拖动完成，等待验证结果...');
       
       // 7. 等待验证结果
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log('等待验证结果...');
       
-      // 8. 检查验证是否成功
-      const successButton = await page.$('div[style*="background: var(--semi-color-success-light-default)"]');
-      if (successButton) {
-        console.log('验证成功!');
-        captchaSuccess = true;
-        return true;
-      } else {
-        console.log('验证失败，准备重试...');
-        retryCount++;
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      // 创建一个Promise来监听验证结果响应
+      const verifyResultPromise = new Promise((resolve, reject) => {
+        const resultTimeout = setTimeout(() => {
+          page.removeAllListeners('response');
+          reject(new Error('等待验证结果超时'));
+        }, 5000);
+        
+        page.on('response', async (response) => {
+          try {
+            const contentType = response.headers()['content-type'] || '';
+            if (contentType.includes('application/json')) {
+              const responseData = await response.json();
+              
+              // 检查是否是验证结果响应
+              if (responseData &&
+                  responseData.hasOwnProperty('success') &&
+                  responseData.hasOwnProperty('message')) {
+                
+                clearTimeout(resultTimeout);
+                page.removeAllListeners('response');
+                resolve(responseData);
+              }
+            }
+          } catch (error) {
+            // 忽略非JSON响应或解析错误
+          }
+        });
+      });
+      
+      try {
+        // 等待验证结果响应或超时
+        const verifyResult = await verifyResultPromise;
+        
+        if (verifyResult.success === true) {
+          console.log(`验证成功! 消息: ${verifyResult.message}`);
+          captchaSuccess = true;
+          return true;
+        } else {
+          console.log(`验证失败: ${verifyResult.message}`);
+          retryCount++;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      } catch (error) {
+        // 如果没有收到明确的验证结果响应，则检查按钮样式
+        console.log('未收到验证结果响应，检查按钮样式...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        const successButton = await page.$('div[style*="background: var(--semi-color-success-light-default)"]');
+        if (successButton) {
+          console.log('通过按钮样式判断验证成功!');
+          captchaSuccess = true;
+          return true;
+        } else {
+          console.log('验证可能失败，准备重试...');
+          retryCount++;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
       }
     } catch (error) {
       console.log('验证码处理出错:', error.message);
@@ -266,16 +327,41 @@ async function loginAndDownload(account) {
         const verifyButton = await page.$('div[aria-describedby][data-popupid]');
         if (verifyButton) {
           console.log(`账户 ${account.username} 需要完成人机验证`);
-          const captchaSuccess = await handleCaptcha(page);
-          if (!captchaSuccess) {
-            console.log(`账户 ${account.username} 人机验证失败`);
-            throw new Error('人机验证失败');
+          
+          // 检查验证按钮是否已经验证成功
+          const buttonStyle = await page.evaluate(el => el.getAttribute('style'), verifyButton);
+          if (buttonStyle && buttonStyle.includes('background: var(--semi-color-success-light-default)')) {
+            console.log(`账户 ${account.username} 已通过人机验证，无需再次验证`);
+          } else {
+            // 需要进行验证
+            const captchaSuccess = await handleCaptcha(page);
+            if (!captchaSuccess) {
+              console.log(`账户 ${account.username} 人机验证失败`);
+              throw new Error('人机验证失败');
+            }
+            
+            // 验证成功后，再次检查验证按钮状态
+            await new Promise(resolve => setTimeout(resolve, 1000)); // 等待状态更新
+            const verifyButtonAfter = await page.$('div[aria-describedby][data-popupid]');
+            if (verifyButtonAfter) {
+              const buttonStyleAfter = await page.evaluate(el => el.getAttribute('style'), verifyButtonAfter);
+              if (buttonStyleAfter && buttonStyleAfter.includes('background: var(--semi-color-success-light-default)')) {
+                console.log(`账户 ${account.username} 验证状态已更新为成功`);
+              } else {
+                console.log(`警告: 账户 ${account.username} 验证可能成功但按钮状态未更新`);
+              }
+            }
+            
+            console.log(`账户 ${account.username} 人机验证成功，继续登录流程`);
           }
-          console.log(`账户 ${account.username} 人机验证成功，继续登录流程`);
+          
           progressBar.update(60);
         } else {
           console.log(`账户 ${account.username} 无需人机验证`);
         }
+        
+        // 短暂等待，确保验证状态已完全更新
+        await new Promise(resolve => setTimeout(resolve, 1000));
 
         // 查找并点击登录按钮，模拟鼠标移动和点击
         await page.waitForSelector('button > span');
