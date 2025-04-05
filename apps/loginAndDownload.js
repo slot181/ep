@@ -336,28 +336,28 @@ async function handleCaptcha(page) {
         throw new Error('验证码图像识别失败，无法确定滑块移动距离');
       }
       
-      // 3. 尝试查找滑块元素
-      let slider = null;
-      const possibleSliderSelectors = [
-        '.gocaptcha-module_dragBlock__bFlwx',
-        'div[class*="dragBlock"]',
-        'div[class*="slider"]',
-        'div[style*="left: 0px"]'
-      ];
-      
-      for (const selector of possibleSliderSelectors) {
-        console.log(`尝试查找滑块元素: ${selector}`);
-        slider = await page.$(selector);
-        if (slider) {
-          console.log(`找到滑块元素: ${selector}`);
-          break;
-        }
-      }
+      // 3. 根据HTML结构精确查找滑块元素
+      console.log('根据HTML结构精确查找滑块元素...');
+      let slider = await page.$('.gocaptcha-module_dragBlock__bFlwx');
       
       if (!slider) {
-        console.log('无法找到滑块元素，尝试查找任何可能的滑块');
-        // 尝试查找任何可能的滑块元素
-        slider = await page.$('div[style*="left: 0px"]');
+        console.log('未找到主要滑块元素，尝试备用选择器...');
+        const possibleSliderSelectors = [
+          'div[class*="dragBlock"]',
+          'div[class*="slider"]',
+          'div[style*="left: 0px"]'
+        ];
+        
+        for (const selector of possibleSliderSelectors) {
+          console.log(`尝试查找滑块元素: ${selector}`);
+          slider = await page.$(selector);
+          if (slider) {
+            console.log(`找到滑块元素: ${selector}`);
+            break;
+          }
+        }
+      } else {
+        console.log('成功找到滑块元素: .gocaptcha-module_dragBlock__bFlwx');
       }
       
       if (!slider) {
@@ -404,6 +404,12 @@ async function handleCaptcha(page) {
       await page.mouse.down();
       await new Promise(resolve => setTimeout(resolve, getShortRandomDelay())); // 短暂停顿
       
+      // 获取滑块初始位置的left值
+      const initialLeft = await page.evaluate(el => {
+        return el.style.left;
+      }, slider);
+      console.log(`滑块初始位置: left=${initialLeft}`);
+      
       // 生成人类般的移动轨迹（从滑块当前位置移动到目标位置）
       const startX = sliderBox.x + sliderBox.width/2;
       const endX = startX + moveDistance;
@@ -413,21 +419,51 @@ async function handleCaptcha(page) {
       await page.screenshot({ path: 'before_move.png' });
       console.log('已保存移动前的截图: before_move.png');
       
+      // 生成移动轨迹
       const path = generateHumanLikePath(startX, endX, sliderBox.y + sliderBox.height/2);
+      console.log(`已生成${path.length}个移动点的轨迹`);
       
       // 按照轨迹移动鼠标
-      for (const point of path) {
+      for (let i = 0; i < path.length; i++) {
+        const point = path[i];
         await page.mouse.move(point.x, point.y);
         await new Promise(r => setTimeout(r, point.delay));
+        
+        // 在移动过程中截取一张中间状态的截图
+        if (i === Math.floor(path.length / 2)) {
+          await page.screenshot({ path: 'moving_halfway.png' });
+          
+          // 获取移动过程中的滑块位置
+          const midwayLeft = await page.evaluate(el => {
+            return el.style.left;
+          }, slider);
+          console.log(`移动过程中的滑块位置: left=${midwayLeft}`);
+        }
       }
       
       // 释放鼠标
       await page.mouse.up();
-      console.log('滑块拖动完成，等待验证结果...');
+      console.log('鼠标已释放，滑块拖动完成');
+      
+      // 等待一小段时间，让滑块位置更新
+      await new Promise(resolve => setTimeout(resolve, 500));
       
       // 保存移动后的截图
       await page.screenshot({ path: 'after_move.png' });
       console.log('已保存移动后的截图: after_move.png');
+      
+      // 获取最终的滑块位置
+      const finalLeft = await page.evaluate(el => {
+        return el.style.left;
+      }, slider);
+      console.log(`滑块最终位置: left=${finalLeft}`);
+      
+      // 验证滑块是否真的移动了
+      if (initialLeft === finalLeft) {
+        console.log('警告: 滑块位置没有变化，可能拖动失败');
+      } else {
+        console.log(`滑块成功移动: 从 ${initialLeft} 到 ${finalLeft}`);
+      }
       
       // 7. 等待验证结果
       console.log('等待验证结果...');
