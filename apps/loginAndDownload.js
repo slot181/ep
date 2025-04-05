@@ -62,45 +62,50 @@ function generateHumanLikePath(startX, endX, y) {
   return path;
 }
 
-// 等待验证码响应并提取信息
-async function waitForCaptchaResponse(page) {
-  return new Promise((resolve, reject) => {
-    let captchaData = null;
-    let responseTimeout = null;
+// 从DOM中提取验证码数据
+async function extractCaptchaDataFromDOM(page) {
+  try {
+    console.log('从DOM中提取验证码数据...');
     
-    // 设置超时
-    responseTimeout = setTimeout(() => {
-      page.removeAllListeners('response');
-      reject(new Error('等待验证码响应超时'));
-    }, 10000);
+    // 等待验证码图片和滑块加载完成
+    await page.waitForSelector('.gocaptcha-module_picture__LRwbY', { visible: true, timeout: 5000 });
+    await page.waitForSelector('.index-module_tile__8pkQD', { visible: true, timeout: 5000 });
     
-    // 监听响应
-    page.on('response', async (response) => {
-      try {
-        // 尝试解析响应内容
-        const contentType = response.headers()['content-type'] || '';
-        if (contentType.includes('application/json')) {
-          const responseData = await response.json();
-          
-          // 检查响应是否包含验证码数据结构
-          if (responseData &&
-              responseData.data &&
-              responseData.data.masterImage &&
-              responseData.data.tileImage &&
-              responseData.data.dots) {
-            
-            console.log('检测到验证码响应');
-            captchaData = responseData.data;
-            clearTimeout(responseTimeout);
-            page.removeAllListeners('response');
-            resolve(captchaData);
-          }
-        }
-      } catch (error) {
-        // 忽略非JSON响应或解析错误
-      }
+    // 提取滑块位置信息
+    const tileInfo = await page.evaluate(() => {
+      const tileElement = document.querySelector('.index-module_tile__8pkQD');
+      if (!tileElement) return null;
+      
+      const style = window.getComputedStyle(tileElement);
+      return {
+        width: parseInt(style.width),
+        height: parseInt(style.height),
+        top: parseInt(style.top),
+        left: parseInt(style.left)
+      };
     });
-  });
+    
+    if (!tileInfo) {
+      throw new Error('无法获取滑块位置信息');
+    }
+    
+    console.log('成功提取滑块位置信息:', JSON.stringify(tileInfo));
+    
+    // 构造验证码数据对象
+    const captchaData = {
+      dots: {
+        x: tileInfo.left + tileInfo.width / 2, // 滑块中心点的x坐标
+        y: tileInfo.top + tileInfo.height / 2, // 滑块中心点的y坐标
+        width: tileInfo.width,
+        height: tileInfo.height
+      }
+    };
+    
+    return captchaData;
+  } catch (error) {
+    console.log('提取验证码数据失败:', error.message);
+    throw error;
+  }
 }
 
 // 处理滑块验证码
@@ -130,8 +135,9 @@ async function handleCaptcha(page) {
       await verifyButton.click();
       console.log('已点击验证按钮，等待验证码加载...');
       
-      // 2. 等待验证码响应，获取dots信息
-      const captchaData = await waitForCaptchaResponse(page);
+      // 2. 等待验证码加载，并从DOM中提取数据
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 等待验证码完全加载
+      const captchaData = await extractCaptchaDataFromDOM(page);
       console.log('获取到验证码数据:', JSON.stringify({
         x: captchaData.dots.x,
         y: captchaData.dots.y,
@@ -146,17 +152,19 @@ async function handleCaptcha(page) {
       const slider = await page.$('.gocaptcha-module_dragBlock__bFlwx');
       const sliderBox = await slider.boundingBox();
       
-      // 5. 计算目标位置（dots.x是目标位置）
+      // 5. 计算目标位置和移动距离
       const targetX = captchaData.dots.x;
-      console.log(`目标位置: x=${targetX}`);
+      // 滑块需要移动的距离 = 目标位置 - 滑块宽度/2（因为我们要让滑块中心对准目标位置）
+      const moveDistance = targetX - sliderBox.width/2;
+      console.log(`目标位置: x=${targetX}, 移动距离: ${moveDistance}px`);
       
       // 6. 模拟人类拖动行为
       await page.mouse.move(sliderBox.x + sliderBox.width/2, sliderBox.y + sliderBox.height/2);
       await page.mouse.down();
       await new Promise(resolve => setTimeout(resolve, getShortRandomDelay())); // 短暂停顿
       
-      // 生成人类般的移动轨迹
-      const path = generateHumanLikePath(sliderBox.x, sliderBox.x + targetX, sliderBox.y + sliderBox.height/2);
+      // 生成人类般的移动轨迹（从滑块当前位置移动到目标位置）
+      const path = generateHumanLikePath(sliderBox.x + sliderBox.width/2, sliderBox.x + moveDistance, sliderBox.y + sliderBox.height/2);
       
       // 按照轨迹移动鼠标
       for (const point of path) {
@@ -171,63 +179,31 @@ async function handleCaptcha(page) {
       // 7. 等待验证结果
       console.log('等待验证结果...');
       
-      // 创建一个Promise来监听验证结果响应
-      const verifyResultPromise = new Promise((resolve, reject) => {
-        const resultTimeout = setTimeout(() => {
-          page.removeAllListeners('response');
-          reject(new Error('等待验证结果超时'));
-        }, 5000);
-        
-        page.on('response', async (response) => {
-          try {
-            const contentType = response.headers()['content-type'] || '';
-            if (contentType.includes('application/json')) {
-              const responseData = await response.json();
-              
-              // 检查是否是验证结果响应
-              if (responseData &&
-                  responseData.hasOwnProperty('success') &&
-                  responseData.hasOwnProperty('message')) {
-                
-                clearTimeout(resultTimeout);
-                page.removeAllListeners('response');
-                resolve(responseData);
-              }
-            }
-          } catch (error) {
-            // 忽略非JSON响应或解析错误
-          }
-        });
-      });
+      // 等待一段时间，让验证结果有时间更新
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
-      try {
-        // 等待验证结果响应或超时
-        const verifyResult = await verifyResultPromise;
-        
-        if (verifyResult.success === true) {
-          console.log(`验证成功! 消息: ${verifyResult.message}`);
-          captchaSuccess = true;
-          return true;
-        } else {
-          console.log(`验证失败: ${verifyResult.message}`);
-          retryCount++;
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      } catch (error) {
-        // 如果没有收到明确的验证结果响应，则检查按钮样式
-        console.log('未收到验证结果响应，检查按钮样式...');
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        const successButton = await page.$('div[style*="background: var(--semi-color-success-light-default)"]');
-        if (successButton) {
-          console.log('通过按钮样式判断验证成功!');
-          captchaSuccess = true;
-          return true;
-        } else {
-          console.log('验证可能失败，准备重试...');
-          retryCount++;
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+      // 检查验证按钮样式是否变为成功状态
+      const successButton = await page.$('div[style*="background: var(--semi-color-success-light-default)"]');
+      if (successButton) {
+        console.log('验证成功! 按钮样式已更新为成功状态');
+        captchaSuccess = true;
+        return true;
+      }
+      
+      // 如果按钮样式未变化，再等待一段时间
+      console.log('按钮样式未变化，继续等待...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // 再次检查验证按钮样式
+      const successButtonRetry = await page.$('div[style*="background: var(--semi-color-success-light-default)"]');
+      if (successButtonRetry) {
+        console.log('验证成功! 按钮样式已更新为成功状态');
+        captchaSuccess = true;
+        return true;
+      } else {
+        console.log('验证失败，准备重试...');
+        retryCount++;
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     } catch (error) {
       console.log('验证码处理出错:', error.message);
