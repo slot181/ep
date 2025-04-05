@@ -158,12 +158,7 @@ async function analyzeSliderCaptcha(originalImagePath, sliderImagePath) {
     };
   } catch (error) {
     console.log('分析滑块验证码图片失败:', error.message);
-    // 返回默认值
-    return {
-      sliderPosition: { x: 60, y: 100 },
-      targetPosition: { x: 200, y: 100 },
-      moveDistance: 140
-    };
+    throw error;
   }
 }
 
@@ -381,11 +376,28 @@ async function handleCaptcha(page) {
       // 如果有图像识别结果，使用它；否则使用滑块位置和宽度计算
       let moveDistance;
       if (captchaAnalysisResult && captchaAnalysisResult.moveDistance) {
-        moveDistance = captchaAnalysisResult.moveDistance;
-        console.log(`使用图像识别结果的移动距离: ${moveDistance}px`);
+        // 获取验证码容器的尺寸，用于计算比例因子
+        const captchaContainer = await page.$('.gocaptcha-module_wrapper__Kpdey, div[class*="captcha"], div[class*="gocaptcha"]');
+        let scaleFactor = 1.0; // 默认比例因子
+        
+        if (captchaContainer) {
+          const containerBox = await captchaContainer.boundingBox();
+          if (containerBox) {
+            // 计算图像坐标系和页面坐标系之间的比例
+            // 假设图像分析时使用的图片宽度是验证码容器的实际宽度
+            const imageWidth = captchaAnalysisResult.targetPosition.x + captchaAnalysisResult.sliderPosition.x;
+            if (imageWidth > 0) {
+              scaleFactor = containerBox.width / imageWidth;
+              console.log(`验证码容器宽度: ${containerBox.width}px, 图像宽度: ${imageWidth}px, 比例因子: ${scaleFactor}`);
+            }
+          }
+        }
+        
+        // 应用比例因子调整移动距离
+        moveDistance = captchaAnalysisResult.moveDistance * scaleFactor;
+        console.log(`原始移动距离: ${captchaAnalysisResult.moveDistance}px, 调整后的移动距离: ${moveDistance}px`);
       }
       console.log(`滑块位置: x=${sliderBox.x}, y=${sliderBox.y}, 宽度: ${sliderBox.width}, 高度: ${sliderBox.height}`);
-      console.log(`计算的移动距离: ${moveDistance}px`);
       
       // 6. 模拟人类拖动行为
       await page.mouse.move(sliderBox.x + sliderBox.width/2, sliderBox.y + sliderBox.height/2);
@@ -395,7 +407,12 @@ async function handleCaptcha(page) {
       // 生成人类般的移动轨迹（从滑块当前位置移动到目标位置）
       const startX = sliderBox.x + sliderBox.width/2;
       const endX = startX + moveDistance;
-      console.log(`生成移动轨迹: 从 ${startX} 到 ${endX}`);
+      console.log(`生成移动轨迹: 从 ${startX.toFixed(2)}px 到 ${endX.toFixed(2)}px，移动距离: ${moveDistance.toFixed(2)}px`);
+      
+      // 保存移动前的截图
+      await page.screenshot({ path: 'before_move.png' });
+      console.log('已保存移动前的截图: before_move.png');
+      
       const path = generateHumanLikePath(startX, endX, sliderBox.y + sliderBox.height/2);
       
       // 按照轨迹移动鼠标
@@ -407,6 +424,10 @@ async function handleCaptcha(page) {
       // 释放鼠标
       await page.mouse.up();
       console.log('滑块拖动完成，等待验证结果...');
+      
+      // 保存移动后的截图
+      await page.screenshot({ path: 'after_move.png' });
+      console.log('已保存移动后的截图: after_move.png');
       
       // 7. 等待验证结果
       console.log('等待验证结果...');
@@ -483,9 +504,6 @@ async function loginAndDownload(account) {
     // 显示进度条
     progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
     progressBar.start(100, 0); // 开始进度条
-
-    // 换行
-    console.log('\n');
 
     let retryCount = 0;
     let loginSuccess = false;
