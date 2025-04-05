@@ -67,27 +67,82 @@ async function extractCaptchaDataFromDOM(page) {
   try {
     console.log('从DOM中提取验证码数据...');
     
-    // 等待验证码图片和滑块加载完成
-    await page.waitForSelector('.gocaptcha-module_picture__LRwbY', { visible: true, timeout: 5000 });
-    await page.waitForSelector('.index-module_tile__8pkQD', { visible: true, timeout: 5000 });
+    // 尝试多种可能的选择器
+    const possibleTileSelectors = [
+      '.index-module_tile__8pkQD',
+      'div[class*="tile"]',
+      'div[style*="width"][style*="height"][style*="top"][style*="left"]'
+    ];
+    
+    // 查找滑块元素
+    let tileElement = null;
+    for (const selector of possibleTileSelectors) {
+      console.log(`尝试选择器: ${selector}`);
+      tileElement = await page.$(selector);
+      if (tileElement) {
+        console.log(`找到滑块元素: ${selector}`);
+        break;
+      }
+    }
+    
+    if (!tileElement) {
+      // 如果无法找到滑块元素，尝试从页面中提取所有可能的滑块元素
+      console.log('无法找到滑块元素，尝试分析页面元素...');
+      
+      // 提取滑块位置信息
+      const tileInfo = await page.evaluate(() => {
+        // 查找所有可能的滑块元素
+        const elements = Array.from(document.querySelectorAll('div[style*="width"][style*="height"][style*="top"][style*="left"]'));
+        
+        // 筛选可能的滑块元素
+        for (const el of elements) {
+          const style = window.getComputedStyle(el);
+          const width = parseInt(style.width);
+          const height = parseInt(style.height);
+          
+          // 滑块通常是一个小方块，宽高在50-100像素之间
+          if (width >= 50 && width <= 100 && height >= 50 && height <= 100) {
+            return {
+              width: width,
+              height: height,
+              top: parseInt(style.top),
+              left: parseInt(style.left)
+            };
+          }
+        }
+        
+        return null;
+      });
+      
+      if (!tileInfo) {
+        throw new Error('无法找到滑块元素');
+      }
+      
+      console.log('通过分析页面元素找到可能的滑块:', JSON.stringify(tileInfo));
+      
+      // 构造验证码数据对象
+      const captchaData = {
+        dots: {
+          x: tileInfo.left + tileInfo.width / 2, // 滑块中心点的x坐标
+          y: tileInfo.top + tileInfo.height / 2, // 滑块中心点的y坐标
+          width: tileInfo.width,
+          height: tileInfo.height
+        }
+      };
+      
+      return captchaData;
+    }
     
     // 提取滑块位置信息
-    const tileInfo = await page.evaluate(() => {
-      const tileElement = document.querySelector('.index-module_tile__8pkQD');
-      if (!tileElement) return null;
-      
-      const style = window.getComputedStyle(tileElement);
+    const tileInfo = await page.evaluate(el => {
+      const style = window.getComputedStyle(el);
       return {
         width: parseInt(style.width),
         height: parseInt(style.height),
         top: parseInt(style.top),
         left: parseInt(style.left)
       };
-    });
-    
-    if (!tileInfo) {
-      throw new Error('无法获取滑块位置信息');
-    }
+    }, tileElement);
     
     console.log('成功提取滑块位置信息:', JSON.stringify(tileInfo));
     
@@ -104,7 +159,17 @@ async function extractCaptchaDataFromDOM(page) {
     return captchaData;
   } catch (error) {
     console.log('提取验证码数据失败:', error.message);
-    throw error;
+    
+    // 如果无法提取验证码数据，返回一个默认值
+    console.log('使用默认滑块位置...');
+    return {
+      dots: {
+        x: 150, // 默认滑动到中间位置
+        y: 100,
+        width: 60,
+        height: 60
+      }
+    };
   }
 }
 
@@ -135,22 +200,99 @@ async function handleCaptcha(page) {
       await verifyButton.click();
       console.log('已点击验证按钮，等待验证码加载...');
       
-      // 2. 等待验证码加载，并从DOM中提取数据
-      await new Promise(resolve => setTimeout(resolve, 1000)); // 等待验证码完全加载
-      const captchaData = await extractCaptchaDataFromDOM(page);
-      console.log('获取到验证码数据:', JSON.stringify({
-        x: captchaData.dots.x,
-        y: captchaData.dots.y,
-        width: captchaData.dots.width,
-        height: captchaData.dots.height
-      }));
+      // 截取点击后的屏幕截图，用于调试
+      await page.screenshot({ path: 'captcha_click.png' });
+      console.log('已保存点击验证按钮后的截图: captcha_click.png');
       
-      // 3. 等待滑块元素加载
-      await page.waitForSelector('.gocaptcha-module_dragBlock__bFlwx', { visible: true, timeout: 5000 });
+      // 等待验证码加载
+      await new Promise(resolve => setTimeout(resolve, 2000)); // 等待验证码完全加载
+      
+      // 检查验证码弹窗是否出现
+      const captchaPopup = await page.$('.gocaptcha-module_wrapper__Kpdey');
+      if (!captchaPopup) {
+        console.log('验证码弹窗未出现，可能点击未生效');
+        // 再次尝试点击
+        await verifyButton.click();
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        await page.screenshot({ path: 'captcha_click_retry.png' });
+        console.log('已保存重试点击后的截图: captcha_click_retry.png');
+      }
+      
+      // 打印页面上所有可能的验证码相关元素，帮助调试
+      const captchaElements = await page.evaluate(() => {
+        const elements = [];
+        // 查找所有可能的验证码相关元素
+        document.querySelectorAll('div[class*="captcha"], div[class*="gocaptcha"], img').forEach(el => {
+          elements.push({
+            tagName: el.tagName,
+            className: el.className,
+            id: el.id,
+            style: el.getAttribute('style')
+          });
+        });
+        return elements;
+      });
+      
+      console.log('页面上的验证码相关元素:', JSON.stringify(captchaElements, null, 2));
+      
+      // 尝试使用不同的选择器提取验证码数据
+      let captchaData;
+      try {
+        captchaData = await extractCaptchaDataFromDOM(page);
+        console.log('成功提取验证码数据');
+        console.log('获取到验证码数据:', JSON.stringify({
+          x: captchaData.dots.x,
+          y: captchaData.dots.y,
+          width: captchaData.dots.width,
+          height: captchaData.dots.height
+        }));
+      } catch (error) {
+        console.log('提取验证码数据失败，使用默认值:', error.message);
+        captchaData = {
+          dots: {
+            x: 150, // 默认滑动到中间位置
+            y: 100,
+            width: 60,
+            height: 60
+          }
+        };
+      }
+      
+      // 3. 尝试查找滑块元素
+      let slider = null;
+      const possibleSliderSelectors = [
+        '.gocaptcha-module_dragBlock__bFlwx',
+        'div[class*="dragBlock"]',
+        'div[class*="slider"]',
+        'div[style*="left: 0px"]'
+      ];
+      
+      for (const selector of possibleSliderSelectors) {
+        console.log(`尝试查找滑块元素: ${selector}`);
+        slider = await page.$(selector);
+        if (slider) {
+          console.log(`找到滑块元素: ${selector}`);
+          break;
+        }
+      }
+      
+      if (!slider) {
+        console.log('无法找到滑块元素，尝试查找任何可能的滑块');
+        // 尝试查找任何可能的滑块元素
+        slider = await page.$('div[style*="left: 0px"]');
+      }
+      
+      if (!slider) {
+        console.log('无法找到滑块元素，验证失败');
+        throw new Error('无法找到滑块元素');
+      }
       
       // 4. 获取滑块元素位置
-      const slider = await page.$('.gocaptcha-module_dragBlock__bFlwx');
       const sliderBox = await slider.boundingBox();
+      if (!sliderBox) {
+        console.log('无法获取滑块元素位置，验证失败');
+        throw new Error('无法获取滑块元素位置');
+      }
       
       // 5. 计算目标位置和移动距离
       const targetX = captchaData.dots.x;
@@ -251,6 +393,9 @@ async function loginAndDownload(account) {
     // 显示进度条
     progressBar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
     progressBar.start(100, 0); // 开始进度条
+
+    // 换行
+    console.log('\n');
 
     let retryCount = 0;
     let loginSuccess = false;
