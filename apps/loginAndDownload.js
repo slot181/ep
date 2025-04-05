@@ -4,6 +4,7 @@ const cliProgress = require('cli-progress');
 const UserAgent1 = require('user-agents');  // 引入生成随机用户代理模块
 
 const MAX_RETRIES = 2; // 最大重试次数
+const MAX_CAPTCHA_RETRIES = 3; // 验证码最大重试次数
 
 // 生成随机延迟（500 到 2000 毫秒之间）
 function getRandomDelay() {
@@ -15,6 +16,166 @@ function getRandomViewport() {
   const width = Math.floor(Math.random() * (1920 - 1024)) + 1024;
   const height = Math.floor(Math.random() * (1080 - 768)) + 768;
   return { width, height };
+}
+
+// 生成类似人类的滑动轨迹
+function generateHumanLikePath(startX, endX, y) {
+  const distance = endX - startX;
+  const steps = Math.floor(Math.random() * 20) + 30; // 30-50步
+  const path = [];
+  
+  // 添加微小抖动和非线性速度
+  for (let i = 0; i <= steps; i++) {
+    const progress = i / steps;
+    
+    // 使用三次贝塞尔曲线模拟加速-减速模式
+    let factor;
+    if (progress < 0.2) {
+      // 开始慢
+      factor = 3 * Math.pow(progress, 2);
+    } else if (progress > 0.8) {
+      // 结束慢
+      factor = 1 - Math.pow(1.5 * (1 - progress), 2);
+    } else {
+      // 中间快
+      factor = 0.2 + (progress - 0.2) * 1.2;
+    }
+    
+    // 添加随机抖动（垂直方向）
+    const jitter = Math.random() * 3 - 1.5;
+    
+    // 添加随机抖动（水平方向，使移动不是完全线性的）
+    const horizontalJitter = Math.random() * 2 - 1;
+    
+    path.push({
+      x: startX + distance * factor + horizontalJitter,
+      y: y + jitter,
+      delay: Math.floor(Math.random() * 10) + 5 // 5-15ms的随机延迟
+    });
+  }
+  
+  return path;
+}
+
+// 等待验证码响应并提取信息
+async function waitForCaptchaResponse(page) {
+  return new Promise((resolve, reject) => {
+    let captchaData = null;
+    let responseTimeout = null;
+    
+    // 设置超时
+    responseTimeout = setTimeout(() => {
+      page.removeAllListeners('response');
+      reject(new Error('等待验证码响应超时'));
+    }, 10000);
+    
+    // 监听响应
+    page.on('response', async (response) => {
+      const url = response.url();
+      
+      // 检查是否是验证码响应
+      if (url.includes('/captcha/get')) {
+        try {
+          const responseData = await response.json();
+          if (responseData && responseData.data && responseData.data.dots) {
+            captchaData = responseData.data;
+            clearTimeout(responseTimeout);
+            page.removeAllListeners('response');
+            resolve(captchaData);
+          }
+        } catch (error) {
+          console.log('解析验证码响应失败:', error.message);
+        }
+      }
+    });
+  });
+}
+
+// 处理滑块验证码
+async function handleCaptcha(page) {
+  console.log('检测到人机验证，开始处理...');
+  
+  let captchaSuccess = false;
+  let retryCount = 0;
+  
+  while (!captchaSuccess && retryCount < MAX_CAPTCHA_RETRIES) {
+    try {
+      // 1. 点击验证按钮
+      const verifyButton = await page.$('div[aria-describedby][data-popupid]');
+      if (!verifyButton) {
+        console.log('未找到验证按钮');
+        return false;
+      }
+      
+      // 检查验证按钮是否已经验证成功
+      const buttonStyle = await page.evaluate(el => el.getAttribute('style'), verifyButton);
+      if (buttonStyle.includes('background: var(--semi-color-success-light-default)')) {
+        console.log('验证已成功，无需再次验证');
+        return true;
+      }
+      
+      // 点击验证按钮
+      await verifyButton.click();
+      console.log('已点击验证按钮，等待验证码加载...');
+      
+      // 2. 等待验证码响应，获取dots信息
+      const captchaData = await waitForCaptchaResponse(page);
+      console.log('获取到验证码数据:', JSON.stringify({
+        x: captchaData.dots.x,
+        y: captchaData.dots.y,
+        width: captchaData.dots.width,
+        height: captchaData.dots.height
+      }));
+      
+      // 3. 等待滑块元素加载
+      await page.waitForSelector('.gocaptcha-module_dragBlock__bFlwx', { visible: true, timeout: 5000 });
+      
+      // 4. 获取滑块元素位置
+      const slider = await page.$('.gocaptcha-module_dragBlock__bFlwx');
+      const sliderBox = await slider.boundingBox();
+      
+      // 5. 计算目标位置（dots.x是目标位置）
+      const targetX = captchaData.dots.x;
+      
+      // 6. 模拟人类拖动行为
+      await page.mouse.move(sliderBox.x + sliderBox.width/2, sliderBox.y + sliderBox.height/2);
+      await page.mouse.down();
+      
+      // 生成人类般的移动轨迹
+      const path = generateHumanLikePath(sliderBox.x, sliderBox.x + targetX, sliderBox.y + sliderBox.height/2);
+      
+      // 按照轨迹移动鼠标
+      for (const point of path) {
+        await page.mouse.move(point.x, point.y);
+        await new Promise(r => setTimeout(r, point.delay));
+      }
+      
+      // 释放鼠标
+      await page.mouse.up();
+      console.log('滑块拖动完成，等待验证结果...');
+      
+      // 7. 等待验证结果
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // 8. 检查验证是否成功
+      const successButton = await page.$('div[style*="background: var(--semi-color-success-light-default)"]');
+      if (successButton) {
+        console.log('验证成功!');
+        captchaSuccess = true;
+        return true;
+      } else {
+        console.log('验证失败，准备重试...');
+        retryCount++;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    } catch (error) {
+      console.log('验证码处理出错:', error.message);
+      retryCount++;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  
+  return captchaSuccess;
 }
 
 async function loginAndDownload(account) {
@@ -100,6 +261,21 @@ async function loginAndDownload(account) {
         await page.type('#password', account.password);
         await new Promise(resolve => setTimeout(resolve, getRandomDelay()));
         progressBar.update(50);
+
+        // 检查是否存在人机验证按钮
+        const verifyButton = await page.$('div[aria-describedby][data-popupid]');
+        if (verifyButton) {
+          console.log(`账户 ${account.username} 需要完成人机验证`);
+          const captchaSuccess = await handleCaptcha(page);
+          if (!captchaSuccess) {
+            console.log(`账户 ${account.username} 人机验证失败`);
+            throw new Error('人机验证失败');
+          }
+          console.log(`账户 ${account.username} 人机验证成功，继续登录流程`);
+          progressBar.update(60);
+        } else {
+          console.log(`账户 ${account.username} 无需人机验证`);
+        }
 
         // 查找并点击登录按钮，模拟鼠标移动和点击
         await page.waitForSelector('button > span');
