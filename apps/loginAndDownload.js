@@ -196,8 +196,16 @@ async function handleCaptcha(page) {
         return true;
       }
       
-      // 点击验证按钮
-      await verifyButton.click();
+      // 找到验证按钮内部的小方框并点击它
+      const captchaCheckbox = await page.$('div[aria-describedby][data-popupid] div[style*="width: 18px"][style*="height: 18px"][style*="border-radius: 3px"]');
+      if (captchaCheckbox) {
+        console.log('找到验证按钮内的小方框，准备点击...');
+        await captchaCheckbox.click();
+      } else {
+        // 如果找不到小方框，退回到点击整个验证按钮
+        console.log('未找到验证按钮内的小方框，点击整个验证按钮...');
+        await verifyButton.click();
+      }
       console.log('已点击验证按钮，等待验证码加载...');
       
       // 截取点击后的屏幕截图，用于调试
