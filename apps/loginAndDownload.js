@@ -2,6 +2,10 @@ const fs = require('fs');
 const puppeteer = require('puppeteer');
 const cliProgress = require('cli-progress');
 const UserAgent1 = require('user-agents');  // 引入生成随机用户代理模块
+// 注意：需要安装以下依赖
+// npm install jimp pixelmatch
+const Jimp = require('jimp');
+const pixelmatch = require('pixelmatch');
 
 const MAX_RETRIES = 2; // 最大重试次数
 const MAX_CAPTCHA_RETRIES = 3; // 验证码最大重试次数
@@ -62,116 +66,198 @@ function generateHumanLikePath(startX, endX, y) {
   return path;
 }
 
-// 从DOM中提取验证码数据
-async function extractCaptchaDataFromDOM(page) {
+// 截取验证码图片并保存
+async function captureAndAnalyzeCaptcha(page) {
   try {
-    console.log('从DOM中提取验证码数据...');
+    console.log('截取验证码图片进行分析...');
     
-    // 尝试多种可能的选择器
-    const possibleTileSelectors = [
-      '.index-module_tile__8pkQD',
-      'div[class*="tile"]',
-      'div[style*="width"][style*="height"][style*="top"][style*="left"]'
-    ];
+    // 等待验证码图片加载
+    await new Promise(resolve => setTimeout(resolve, 1000));
     
-    // 查找滑块元素
-    let tileElement = null;
-    for (const selector of possibleTileSelectors) {
-      console.log(`尝试选择器: ${selector}`);
-      tileElement = await page.$(selector);
-      if (tileElement) {
-        console.log(`找到滑块元素: ${selector}`);
-        break;
-      }
+    // 查找验证码容器
+    const captchaContainer = await page.$('.gocaptcha-module_wrapper__Kpdey, div[class*="captcha"], div[class*="gocaptcha"]');
+    if (!captchaContainer) {
+      console.log('未找到验证码容器');
+      throw new Error('未找到验证码容器');
     }
     
-    if (!tileElement) {
-      // 如果无法找到滑块元素，尝试从页面中提取所有可能的滑块元素
-      console.log('无法找到滑块元素，尝试分析页面元素...');
-      
-      // 提取滑块位置信息
-      const tileInfo = await page.evaluate(() => {
-        // 查找所有可能的滑块元素
-        const elements = Array.from(document.querySelectorAll('div[style*="width"][style*="height"][style*="top"][style*="left"]'));
-        
-        // 筛选可能的滑块元素
-        for (const el of elements) {
-          const style = window.getComputedStyle(el);
-          const width = parseInt(style.width);
-          const height = parseInt(style.height);
-          
-          // 滑块通常是一个小方块，宽高在50-100像素之间
-          if (width >= 50 && width <= 100 && height >= 50 && height <= 100) {
-            return {
-              width: width,
-              height: height,
-              top: parseInt(style.top),
-              left: parseInt(style.left)
-            };
-          }
-        }
-        
-        return null;
-      });
-      
-      if (!tileInfo) {
-        throw new Error('无法找到滑块元素');
-      }
-      
-      console.log('通过分析页面元素找到可能的滑块:', JSON.stringify(tileInfo));
-      
-      // 构造验证码数据对象
-      const captchaData = {
-        dots: {
-          x: tileInfo.left + tileInfo.width / 2, // 滑块中心点的x坐标
-          y: tileInfo.top + tileInfo.height / 2, // 滑块中心点的y坐标
-          width: tileInfo.width,
-          height: tileInfo.height
-        }
-      };
-      
-      return captchaData;
+    // 截取验证码图片
+    const captchaDir = './captcha_images';
+    if (!fs.existsSync(captchaDir)) {
+      fs.mkdirSync(captchaDir);
     }
     
-    // 提取滑块位置信息
-    const tileInfo = await page.evaluate(el => {
-      const style = window.getComputedStyle(el);
-      return {
-        width: parseInt(style.width),
-        height: parseInt(style.height),
-        top: parseInt(style.top),
-        left: parseInt(style.left)
-      };
-    }, tileElement);
+    // 截取验证码容器的图片
+    const originalImagePath = `${captchaDir}/original_captcha.png`;
+    await captchaContainer.screenshot({ path: originalImagePath });
+    console.log(`已保存验证码原始图片: ${originalImagePath}`);
     
-    console.log('成功提取滑块位置信息:', JSON.stringify(tileInfo));
+    // 等待一段时间，然后截取滑块移动后的图片
+    await page.mouse.move(100, 100); // 移动鼠标到其他位置，确保滑块显示
+    await new Promise(resolve => setTimeout(resolve, 500));
     
-    // 构造验证码数据对象
-    const captchaData = {
-      dots: {
-        x: tileInfo.left + tileInfo.width / 2, // 滑块中心点的x坐标
-        y: tileInfo.top + tileInfo.height / 2, // 滑块中心点的y坐标
-        width: tileInfo.width,
-        height: tileInfo.height
-      }
-    };
+    const sliderImagePath = `${captchaDir}/slider_captcha.png`;
+    await captchaContainer.screenshot({ path: sliderImagePath });
+    console.log(`已保存滑块图片: ${sliderImagePath}`);
     
-    return captchaData;
+    // 分析图片，找出滑块和目标位置
+    const result = await analyzeSliderCaptcha(originalImagePath, sliderImagePath);
+    return result;
   } catch (error) {
-    console.log('提取验证码数据失败:', error.message);
+    console.log('截取验证码图片失败:', error.message);
+    throw error;
+  }
+}
+
+// 分析滑块验证码图片，找出滑块和目标位置
+async function analyzeSliderCaptcha(originalImagePath, sliderImagePath) {
+  try {
+    console.log('分析滑块验证码图片...');
     
-    // 如果无法提取验证码数据，返回一个默认值
-    console.log('使用默认滑块位置...');
+    // 读取图片
+    const originalImage = await Jimp.read(originalImagePath);
+    const sliderImage = await Jimp.read(sliderImagePath);
+    
+    // 获取图片尺寸
+    const width = originalImage.getWidth();
+    const height = originalImage.getHeight();
+    
+    // 创建差异图像
+    const diffImage = new Jimp(width, height);
+    
+    // 使用pixelmatch比较两张图片的差异
+    const diffPixels = pixelmatch(
+      originalImage.bitmap.data,
+      sliderImage.bitmap.data,
+      diffImage.bitmap.data,
+      width,
+      height,
+      { threshold: 0.1 } // 阈值，越小越敏感
+    );
+    
+    // 保存差异图像用于调试
+    await diffImage.writeAsync(`./captcha_images/diff_captcha.png`);
+    console.log('已保存差异图片: ./captcha_images/diff_captcha.png');
+    
+    // 分析差异图像，找出滑块位置
+    const sliderPosition = findSliderPosition(diffImage);
+    console.log('滑块位置:', sliderPosition);
+    
+    // 分析原始图像，找出目标位置
+    const targetPosition = findTargetPosition(originalImage, diffImage, sliderPosition);
+    console.log('目标位置:', targetPosition);
+    
+    // 计算需要移动的距离
+    const moveDistance = targetPosition.x - sliderPosition.x;
+    console.log('需要移动的距离:', moveDistance);
+    
     return {
-      dots: {
-        x: 150, // 默认滑动到中间位置
-        y: 100,
-        width: 60,
-        height: 60
-      }
+      sliderPosition,
+      targetPosition,
+      moveDistance
+    };
+  } catch (error) {
+    console.log('分析滑块验证码图片失败:', error.message);
+    // 返回默认值
+    return {
+      sliderPosition: { x: 60, y: 100 },
+      targetPosition: { x: 200, y: 100 },
+      moveDistance: 140
     };
   }
 }
+
+// 在差异图像中找出滑块位置
+function findSliderPosition(diffImage) {
+  const width = diffImage.getWidth();
+  const height = diffImage.getHeight();
+  
+  // 查找差异最明显的区域作为滑块位置
+  let maxDiffX = 0;
+  let maxDiffY = 0;
+  let maxDiffCount = 0;
+  
+  // 扫描图像，寻找差异点最集中的区域
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      // 获取当前像素的RGBA值
+      const rgba = Jimp.intToRGBA(diffImage.getPixelColor(x, y));
+      
+      // 如果像素有明显差异（非黑色）
+      if (rgba.r > 30 || rgba.g > 30 || rgba.b > 30) {
+        // 计算周围30x30区域内的差异点数量
+        let diffCount = 0;
+        for (let dy = -15; dy <= 15; dy++) {
+          for (let dx = -15; dx <= 15; dx++) {
+            if (y + dy >= 0 && y + dy < height && x + dx >= 0 && x + dx < width) {
+              const pixelRgba = Jimp.intToRGBA(diffImage.getPixelColor(x + dx, y + dy));
+              if (pixelRgba.r > 30 || pixelRgba.g > 30 || pixelRgba.b > 30) {
+                diffCount++;
+              }
+            }
+          }
+        }
+        
+        // 更新最大差异区域
+        if (diffCount > maxDiffCount) {
+          maxDiffCount = diffCount;
+          maxDiffX = x;
+          maxDiffY = y;
+        }
+      }
+    }
+  }
+  
+  return { x: maxDiffX, y: maxDiffY };
+}
+
+// 在原始图像中找出目标位置
+function findTargetPosition(originalImage, diffImage, sliderPosition) {
+  const width = originalImage.getWidth();
+  const height = originalImage.getHeight();
+  
+  // 从滑块位置向右扫描，寻找可能的目标位置
+  // 目标位置通常是图像中的缺口或颜色差异明显的区域
+  
+  let targetX = sliderPosition.x + 50; // 默认至少向右移动50像素
+  let targetY = sliderPosition.y;
+  
+  // 扫描图像右侧部分
+  for (let x = sliderPosition.x + 20; x < width - 20; x++) {
+    // 在滑块高度附近检查垂直线上的像素
+    let edgeDetected = false;
+    let edgeStrength = 0;
+    
+    for (let y = Math.max(0, sliderPosition.y - 15); y < Math.min(height, sliderPosition.y + 15); y++) {
+      // 检查水平方向的颜色变化
+      if (x + 1 < width) {
+        const pixel1 = Jimp.intToRGBA(originalImage.getPixelColor(x, y));
+        const pixel2 = Jimp.intToRGBA(originalImage.getPixelColor(x + 1, y));
+        
+        // 计算相邻像素的颜色差异
+        const diff = Math.abs(pixel1.r - pixel2.r) + Math.abs(pixel1.g - pixel2.g) + Math.abs(pixel1.b - pixel2.b);
+        
+        if (diff > 30) { // 颜色变化明显
+          edgeStrength += diff;
+          edgeDetected = true;
+        }
+      }
+    }
+    
+    // 如果检测到边缘，并且边缘强度足够大
+    if (edgeDetected && edgeStrength > 300) {
+      targetX = x;
+      break;
+    }
+  }
+  
+  // 确保目标位置在合理范围内
+  targetX = Math.min(width - 20, Math.max(sliderPosition.x + 20, targetX));
+  
+  return { x: targetX, y: targetY };
+}
+
+// DOM提取方法已删除，完全使用图像识别方法
 
 // 处理滑块验证码
 async function handleCaptcha(page) {
@@ -243,27 +329,16 @@ async function handleCaptcha(page) {
       
       console.log('页面上的验证码相关元素:', JSON.stringify(captchaElements, null, 2));
       
-      // 尝试使用不同的选择器提取验证码数据
-      let captchaData;
+      // 使用图像识别方法分析验证码
+      let captchaAnalysisResult;
       try {
-        captchaData = await extractCaptchaDataFromDOM(page);
-        console.log('成功提取验证码数据');
-        console.log('获取到验证码数据:', JSON.stringify({
-          x: captchaData.dots.x,
-          y: captchaData.dots.y,
-          width: captchaData.dots.width,
-          height: captchaData.dots.height
-        }));
+        console.log('使用图像识别方法分析验证码...');
+        captchaAnalysisResult = await captureAndAnalyzeCaptcha(page);
+        console.log('图像识别分析结果:', JSON.stringify(captchaAnalysisResult));
       } catch (error) {
-        console.log('提取验证码数据失败，使用默认值:', error.message);
-        captchaData = {
-          dots: {
-            x: 150, // 默认滑动到中间位置
-            y: 100,
-            width: 60,
-            height: 60
-          }
-        };
+        console.log('图像识别分析失败:', error.message);
+        // 图像识别失败时直接报错
+        throw new Error('验证码图像识别失败，无法确定滑块移动距离');
       }
       
       // 3. 尝试查找滑块元素
@@ -302,11 +377,15 @@ async function handleCaptcha(page) {
         throw new Error('无法获取滑块元素位置');
       }
       
-      // 5. 计算目标位置和移动距离
-      const targetX = captchaData.dots.x;
-      // 滑块需要移动的距离 = 目标位置 - 滑块宽度/2（因为我们要让滑块中心对准目标位置）
-      const moveDistance = targetX - sliderBox.width/2;
-      console.log(`目标位置: x=${targetX}, 移动距离: ${moveDistance}px`);
+      // 5. 使用图像识别分析结果计算移动距离
+      // 如果有图像识别结果，使用它；否则使用滑块位置和宽度计算
+      let moveDistance;
+      if (captchaAnalysisResult && captchaAnalysisResult.moveDistance) {
+        moveDistance = captchaAnalysisResult.moveDistance;
+        console.log(`使用图像识别结果的移动距离: ${moveDistance}px`);
+      }
+      console.log(`滑块位置: x=${sliderBox.x}, y=${sliderBox.y}, 宽度: ${sliderBox.width}, 高度: ${sliderBox.height}`);
+      console.log(`计算的移动距离: ${moveDistance}px`);
       
       // 6. 模拟人类拖动行为
       await page.mouse.move(sliderBox.x + sliderBox.width/2, sliderBox.y + sliderBox.height/2);
@@ -314,7 +393,10 @@ async function handleCaptcha(page) {
       await new Promise(resolve => setTimeout(resolve, getShortRandomDelay())); // 短暂停顿
       
       // 生成人类般的移动轨迹（从滑块当前位置移动到目标位置）
-      const path = generateHumanLikePath(sliderBox.x + sliderBox.width/2, sliderBox.x + moveDistance, sliderBox.y + sliderBox.height/2);
+      const startX = sliderBox.x + sliderBox.width/2;
+      const endX = startX + moveDistance;
+      console.log(`生成移动轨迹: 从 ${startX} 到 ${endX}`);
+      const path = generateHumanLikePath(startX, endX, sliderBox.y + sliderBox.height/2);
       
       // 按照轨迹移动鼠标
       for (const point of path) {
