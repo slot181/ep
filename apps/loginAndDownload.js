@@ -445,25 +445,9 @@ async function handleCaptcha(page) {
       await page.mouse.up();
       console.log('鼠标已释放，滑块拖动完成');
       
-      // 等待一小段时间，让滑块位置更新
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
       // 保存移动后的截图
       await page.screenshot({ path: 'after_move.png' });
       console.log('已保存移动后的截图: after_move.png');
-      
-      // 获取最终的滑块位置
-      const finalLeft = await page.evaluate(el => {
-        return el.style.left;
-      }, slider);
-      console.log(`滑块最终位置: left=${finalLeft}`);
-      
-      // 验证滑块是否真的移动了
-      if (initialLeft === finalLeft) {
-        console.log('警告: 滑块位置没有变化，可能拖动失败');
-      } else {
-        console.log(`滑块成功移动: 从 ${initialLeft} 到 ${finalLeft}`);
-      }
       
       // 7. 等待验证结果
       console.log('等待验证结果...');
